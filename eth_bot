@@ -1,0 +1,148 @@
+import json
+import asyncio
+import time
+from web3 import Web3
+from web3.middleware import geth_poa_middleware
+
+# Replace with your Infura project ID and a valid private key for testnet
+INFURA_URL = 'https://mainnet.infura.io/v3/YOUR_INFURA_PROJECT_ID'  # Replace with your Infura Project ID
+PRIVATE_KEY = '0x4c0883a69102937d6231471b5ecb8f8aeb92f4c9c55b98e64a6a7f0b3b45b2f7'  # Replace with your secure private key
+
+# Web3 setup
+w3 = Web3(Web3.HTTPProvider(INFURA_URL))
+w3.middleware_onion.inject(geth_poa_middleware, layer=0)
+
+# Bot's Ethereum address
+account = w3.eth.account.from_key(PRIVATE_KEY)
+wallet_address = account.address
+
+# Define DEX router addresses (use correct addresses)
+UNISWAP_ROUTER = Web3.to_checksum_address("0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")  # Uniswap V2 Router
+SUSHISWAP_ROUTER = Web3.to_checksum_address("0xC0AEe478e3658e2610c5F7A4A2E1777Ce9e4f2Ac")  # SushiSwap Router
+BALANCER_ROUTER = Web3.to_checksum_address("0xBA12222222228d8Ba445958a75a0704d566BF2C8")  # Balancer Router
+
+# Multi-token arbitrage: List of token pairs
+TOKEN_PAIRS = [
+    {
+        'token_in': Web3.to_checksum_address('0x6B175474E89094C44Da98b954EedeAC495271d0F'),  # DAI
+        'token_out': Web3.to_checksum_address('0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606EB48'),  # USDC
+        'name': 'DAI/USDC'
+    },
+    {
+        'token_in': Web3.to_checksum_address('0xdAC17F958D2ee523a2206206994597C13D831ec7'),  # USDT
+        'token_out': Web3.to_checksum_address('0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2'),  # WETH
+        'name': 'USDT/WETH'
+    }
+    # Add more token pairs if needed
+]
+
+# Dummy ABI for testing purposes
+dummy_abi = json.loads('''
+[
+    {
+        "constant": true,
+        "inputs": [
+            {
+                "name": "amountIn",
+                "type": "uint256"
+            },
+            {
+                "name": "path",
+                "type": "address[]"
+            }
+        ],
+        "name": "getAmountsOut",
+        "outputs": [
+            {
+                "name": "amounts",
+                "type": "uint256[]"
+            }
+        ],
+        "payable": false,
+        "stateMutability": "view",
+        "type": "function"
+    }
+]
+''')
+
+# Helper function to calculate gas price
+async def get_gas_price():
+    gas_price = w3.eth.gas_price
+    return gas_price
+
+# Get price of token on Uniswap
+def get_price_uniswap(token_in, token_out, amount_in):
+    uniswap_contract = w3.eth.contract(address=UNISWAP_ROUTER, abi=dummy_abi)
+    price = uniswap_contract.functions.getAmountsOut(amount_in, [token_in, token_out]).call()
+    return price[-1]
+
+# Get price of token on Sushiswap
+def get_price_sushiswap(token_in, token_out, amount_in):
+    sushiswap_contract = w3.eth.contract(address=SUSHISWAP_ROUTER, abi=dummy_abi)
+    price = sushiswap_contract.functions.getAmountsOut(amount_in, [token_in, token_out]).call()
+    return price[-1]
+
+# Get price of token on Balancer
+def get_price_balancer(token_in, token_out, amount_in):
+    balancer_contract = w3.eth.contract(address=BALANCER_ROUTER, abi=dummy_abi)
+    price = balancer_contract.functions.getAmountsOut(amount_in, [token_in, token_out]).call()
+    return price[-1]
+
+# Function to handle transaction retries with exponential backoff
+async def send_transaction_with_retry(transaction, retries=3, delay=2):
+    attempt = 0
+    while attempt < retries:
+        try:
+            tx_hash = w3.eth.send_raw_transaction(transaction)
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+            if receipt.status == 1:
+                print(f"Transaction successful with hash: {tx_hash.hex()}")
+                return receipt
+            else:
+                print("Transaction failed. Retrying...")
+                attempt += 1
+                time.sleep(delay * 2 ** attempt)  # Exponential backoff
+        except Exception as e:
+            print(f"Error during transaction: {e}. Retrying...")
+            attempt += 1
+            time.sleep(delay * 2 ** attempt)
+
+    print("All retry attempts failed.")
+    return None
+
+# Define an arbitrage opportunity detector
+async def check_arbitrage_opportunity():
+    while True:
+        for pair in TOKEN_PAIRS:
+            token_in = pair['token_in']
+            token_out = pair['token_out']
+            amount_in = w3.to_wei(1, 'ether')  # Updated method name
+
+            # Get prices from Uniswap, Sushiswap, Balancer
+            uniswap_price = get_price_uniswap(token_in, token_out, amount_in)
+            sushiswap_price = get_price_sushiswap(token_in, token_out, amount_in)
+            balancer_price = get_price_balancer(token_in, token_out, amount_in)
+
+            # Calculate arbitrage opportunities
+            max_price = max(uniswap_price, sushiswap_price, balancer_price)
+            min_price = min(uniswap_price, sushiswap_price, balancer_price)
+
+            if max_price > min_price:
+                profit_percentage = (max_price - min_price) / min_price * 100
+                if profit_percentage > 0.5:  # Set your arbitrage threshold here
+                    print(f'Arbitrage opportunity found for {pair["name"]}! Profit: {profit_percentage:.2f}%')
+                    await simulate_arbitrage(token_in, token_out, amount_in)
+                else:
+                    print(f"No profitable arbitrage found for {pair['name']}.")
+        await asyncio.sleep(10)  # Check every 10 seconds
+
+# Simulate arbitrage (replace with actual execution logic if needed)
+async def simulate_arbitrage(token_in, token_out, amount_in):
+    print(f"Simulating arbitrage for {token_in} to {token_out} with amount {amount_in}. This is a dummy simulation.")
+
+# Start monitoring
+if __name__ == '__main__':
+    # Create a new event loop and set it as the current one
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(check_arbitrage_opportunity())
